@@ -1,0 +1,108 @@
+  {% if error %}
+  <section class="alert" role="alert">
+    <h2>本批未完成</h2>
+    <p>{{ error.message }}</p>
+    {% if error.files %}
+    <p class="alert-files">涉及文件：</p>
+    <ul class="file-list">
+      {% for file in error.files %}<li class="mono">{{ file }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+    {% if error.columns %}
+    <p class="alert-files">涉及列：</p>
+    <ul class="file-list">
+      {% for column in error.columns %}<li class="mono">{{ column }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+    <p class="hint">整批成功才会生成 ZIP；本次没有提供下载。</p>
+  </section>
+  {% endif %}
+
+  {% if result %}
+  <section class="summary">
+    <div class="summary-title">
+      <div>
+        <h2>字段 ID 已补齐</h2>
+        <p class="subtle">
+          数据文件 {{ result.files|length }} 个 ·
+          补上 ID {{ result.added_count }} 处 ·
+          保留原有 ID {{ result.kept_count }} 处 ·
+          清单与位置删除文件未改动
+        </p>
+      </div>
+      {% if source == 'sample' %}
+      <span class="badge sample">内置样例</span>
+      {% endif %}
+    </div>
+    <div class="chips">
+      <span class="chip"><b>{{ result.files|length }}</b> 个副本已重写</span>
+      <span class="chip"><b>{{ result.added_count }}</b> 个字段新获 ID</span>
+      <span class="chip"><b>{{ result.kept_count }}</b> 个字段沿用原 ID</span>
+      <span class="chip">按原上传文件名打包 <code>.zip</code></span>
+    </div>
+    {% if source == 'sample' %}
+    <p class="notice">
+      样例中 <code>base_fare</code> 与 <code>surcharge</code> 两个 struct 下都有同名的旧金额列
+      <code>fare_cents</code>。先按父字段 ID <code>3</code> / <code>4</code> 找到各自的子映射，
+      再分别补上 <code>31</code> 与 <code>41</code>；父字段和 <code>ticket_no</code> 等原有 ID 保持不动。
+    </p>
+    {% endif %}
+    {% if download_url %}
+    <div class="download-row">
+      <a class="button primary" href="{{ download_url }}">下载 ZIP（按原上传文件名）</a>
+    </div>
+    {% endif %}
+  </section>
+
+  {% if result.warnings %}
+  <section class="card">
+    <ul class="warnings">
+      {% for warning in result.warnings %}<li>{{ warning }}</li>{% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+
+  <section class="ticket-list" aria-label="逐文件字段 ID 结果">
+    {% for item in result.files %}
+    <article class="file-card">
+      <div class="ticket-head">
+        <div class="ticket-id">
+          <span class="eyebrow">副本</span>
+          <span class="ticket-no mono">{{ item.entry.uploaded_filename }}</span>
+        </div>
+        <div class="ticket-status">
+          <span class="badge ok">已重写</span>
+        </div>
+      </div>
+      <p class="path mono">{{ item.entry.original_path }}</p>
+      <div class="table-wrap">
+        <table class="result-table">
+          <thead>
+            <tr>
+              <th>列路径</th>
+              <th>字段 ID</th>
+              <th>处理</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for change in item.changes %}
+            <tr class="{% if change.added %}row-added{% else %}row-kept{% endif %}">
+              <td class="mono">{{ change.path }}</td>
+              <td class="row-index">{{ change.field_id }}</td>
+              <td>
+                {% if change.added %}
+                  <span class="pill deleted">补上</span>
+                {% else %}
+                  <span class="pill present">原有 ID 保留</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </article>
+    {% endfor %}
+  </section>
+  {% endif %}
+

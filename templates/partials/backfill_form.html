@@ -1,0 +1,55 @@
+  <section class="card form-card">
+    <div class="card-head">
+      <h2>上传并为旧副本补字段 ID</h2>
+      <p class="subtle">
+        传入现有有效文件清单、清单中 data 文件的 Parquet 副本，以及表属性
+        <code>schema.name-mapping.default</code> 的 JSON 内容。只处理标量列和一层 struct。
+      </p>
+    </div>
+    <form method="post" action="{{ url_for('backfill') }}" enctype="multipart/form-data">
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-label">有效文件清单 <small>CSV 或 JSON</small></span>
+          <input type="file" name="manifest" accept=".csv,.json,text/csv,application/json" required>
+          <span class="field-hint">
+            列：<code>original_path</code>、<code>uploaded_filename</code>、
+            <code>file_type</code>、<code>data_sequence_number</code>。只重写
+            <code>data</code> 文件，清单与位置删除副本继续使用、不打包。
+          </span>
+        </label>
+        <label class="field">
+          <span class="field-label">Parquet 副本 <small>清单中的 data 文件，可多选</small></span>
+          <input type="file" name="files" accept=".parquet,application/octet-stream" multiple required>
+          <span class="field-hint">
+            文件名与清单的 <code>uploaded_filename</code> 一致；分批读取并重写，
+            列名、类型、值与行序不变。
+          </span>
+        </label>
+      </div>
+
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-label">name mapping JSON <small>可直接粘贴</small></span>
+          <textarea name="name_mapping" rows="8" placeholder='[{"field-id": 3, "names": ["base_fare"], "fields": [{"field-id": 31, "names": ["fare_cents"]}]}]'>{{ mapping_text }}</textarea>
+          <span class="field-hint">
+            支持顶层数组，或含 <code>fields</code> / <code>mapping</code> 数组的对象；
+            字段键可用 <code>field-id</code>（也接受 <code>field_id</code>、<code>id</code>）
+            与 <code>names</code> / <code>name</code>。填入内容时优先使用此处的 JSON。
+          </span>
+        </label>
+        <label class="field narrow">
+          <span class="field-label">或上传 JSON 文件</span>
+          <input type="file" name="name_mapping_file" accept=".json,.txt,application/json,text/plain">
+          <span class="field-hint">也可以把 JSON 文件与 Parquet 一起放进“Parquet 副本”多选框。</span>
+        </label>
+      </div>
+      <input type="hidden" name="mapping_input" value="{{ mapping_input or 'text' }}">
+
+      <div class="form-actions">
+        <button class="button primary" type="submit">补齐并打包 ZIP</button>
+        <a class="button ghost" href="{{ url_for('sample_field_ids') }}">载入内置样例</a>
+        <span class="subtle limit">单次上传上限 {{ max_upload_mb }} MB · 每批 {{ batch_size }} 行</span>
+      </div>
+    </form>
+  </section>
+

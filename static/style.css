@@ -60,6 +60,8 @@ code {
   padding: 18px 0;
 }
 
+.topnav { display: flex; flex-wrap: wrap; gap: 8px; }
+
 .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
 
 .mark {
@@ -418,3 +420,36 @@ input:focus, textarea:focus {
   h1 { font-size: 18px; }
   .ticket-no { font-size: 24px; }
 }
+
+/* ---- field-ID backfill page ---- */
+
+.file-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 18px 20px 16px;
+  border-left: 5px solid var(--teal);
+}
+
+.file-card .path {
+  margin: 0 0 10px;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+tbody tr.row-added { background: #fffdf7; }
+tbody tr.row-kept { background: #fbfefd; }
+
+.download-row { margin-top: 16px; }
+
+.rules-card .rules {
+  margin: 0;
+  padding-left: 20px;
+  color: #3d5161;
+  font-size: 13.5px;
+}
+.rules-card .rules li { margin: 5px 0; }
+.rules-card b { color: var(--navy); }
+
+.topbar .button.ghost { white-space: nowrap; }

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>渡轮结算 · Iceberg 字段 ID 回填</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="wrap topbar-inner">
+    <div class="brand">
+      <span class="mark" aria-hidden="true">⛴</span>
+      <div>
+        <h1>渡轮结算 · Iceberg 字段 ID 回填</h1>
+        <p>历史 Parquet 副本 · 只补标量列与一层 struct</p>
+      </div>
+    </div>
+    <nav class="topnav">
+      <a class="button ghost" href="{{ url_for('sample_field_ids') }}">载入样例</a>
+      <a class="button ghost" href="{{ url_for('checker_index') }}">票号删除核对</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  {% include "partials/backfill_body.html" %}
+  {% include "partials/backfill_form.html" %}
+
+  <section class="card rules-card">
+    <div class="card-head">
+      <h2>处理规则</h2>
+    </div>
+    <ul class="rules">
+      <li><b>已有 ID 不动</b>：列上已有 <code>PARQUET:field_id</code> 时原样保留。</li>
+      <li><b>缺 ID 唯一匹配</b>：按列名与 name mapping 的别名匹配，必须恰好命中一个条目。</li>
+      <li><b>子列走父 ID</b>：struct 子列只在父字段 ID 指向的映射分支里查找，所以不同 struct 下的同名子列会得到不同 ID。</li>
+      <li><b>单文件内唯一</b>：同一文件中已有 ID 与新补 ID 不得重复，重复即报错。</li>
+      <li><b>全有或全无</b>：缺文件、列无法唯一匹配、ID 重复或读写失败都会指出文件与涉及的列，本次不提供下载。</li>
+      <li><b>只处理 data</b>：位置删除文件和原清单继续使用；成功后按原上传文件名打包 ZIP。</li>
+    </ul>
+  </section>
+</main>
+
+<footer class="footer">
+  <div class="wrap">
+    <p>
+      补齐的是 Parquet 模式里的 Iceberg 字段 ID，使查询引擎可以按 ID 读到票价；
+      列名、类型、值与行序保持原样，原有 ID 不覆盖，原清单与位置删除文件继续使用。
+    </p>
+  </div>
+</footer>
+</body>
+</html>

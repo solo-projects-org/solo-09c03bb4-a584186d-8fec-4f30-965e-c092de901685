@@ -1,0 +1,47 @@
+  <section class="card form-card">
+    <div class="card-head">
+      <h2>上传并核对</h2>
+      <p class="subtle">
+        同一航次日分区的 Iceberg v2 有效文件清单，以及清单中每个 data /
+        position_delete 文件的 Parquet 副本。
+      </p>
+    </div>
+    <form method="post" action="{{ url_for('check') }}" enctype="multipart/form-data">
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-label">有效文件清单 <small>CSV 或 JSON</small></span>
+          <input type="file" name="manifest" accept=".csv,.json,text/csv,application/json" required>
+          <span class="field-hint">
+            列：<code>original_path</code>、<code>uploaded_filename</code>、
+            <code>file_type</code>、<code>data_sequence_number</code>
+          </span>
+        </label>
+        <label class="field">
+          <span class="field-label">Parquet 副本 <small>可多选</small></span>
+          <input type="file" name="files" accept=".parquet,application/octet-stream" multiple>
+          <span class="field-hint">
+            文件类型：<code>data</code>、<code>position_delete</code>、
+            <code>equality_delete</code>（忽略）
+          </span>
+        </label>
+      </div>
+
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-label">整数票号 <small>逗号、空格或换行分隔</small></span>
+          <textarea name="tickets" rows="3" placeholder="4242, 1003, 4218">{{ tickets_text }}</textarea>
+        </label>
+        <label class="field narrow">
+          <span class="field-label">票号列名</span>
+          <input type="text" name="ticket_column" value="{{ ticket_column or 'ticket_no' }}">
+          <span class="field-hint">Parquet 中整数票号列的名称</span>
+        </label>
+      </div>
+
+      <div class="form-actions">
+        <button class="button primary" type="submit">开始核对</button>
+        <a class="button ghost" href="{{ url_for('sample') }}">载入内置样例（演示跳过前面的行组）</a>
+        <span class="subtle limit">单次上传上限 {{ max_upload_mb }} MB</span>
+      </div>
+    </form>
+  </section>

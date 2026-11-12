@@ -1,6 +1,6 @@
-"""Generate the bundled sample used by the "载入样例" button.
+"""Generate the bundled sample used by both demo pages.
 
-The sample deliberately contains:
+Legacy checker sample (``/sample``):
 
 * data-0001.parquet: five row groups.  Ticket 4242 lives in row group 4
   (zero-based), so row groups 0-3 are skipped by min/max statistics before
@@ -14,10 +14,21 @@ The sample deliberately contains:
   sequence number 6 < data file sequence number 7; it must be ignored.
 * An equality-delete manifest entry with no uploaded replica; it must be
   ignored because only positional deletes are processed.
+
+Field-ID sample (``/sample/field-ids``):
+
+* The data files are historical replicas written *without* any Iceberg field
+  IDs.
+* Both structs, ``base_fare`` and ``surcharge``, contain a child column named
+  ``fare_cents``.  The bundled name mapping gives those two same-named old
+  amount columns different IDs (31 and 41) because the child lookup goes
+  through the parent struct's field ID.
+* The position-delete files have no field IDs and are not rewritten.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pyarrow as pa
@@ -34,11 +45,19 @@ DELETE2_PATH = f"{BASE}/delete-pos/delete-pos-0002.parquet"
 STALE_DELETE_PATH = f"{BASE}/delete-pos/delete-pos-stale-0001.parquet"
 EQ_DELETE_PATH = f"{BASE}/delete-eq/delete-eq-0001.parquet"
 
+FARE_STRUCT = pa.struct(
+    [
+        ("fare_cents", pa.int64()),
+        ("currency", pa.string()),
+    ]
+)
+
 DATA_SCHEMA = pa.schema(
     [
         ("ticket_no", pa.int64()),
         ("passenger_name", pa.string()),
-        ("fare_cents", pa.int64()),
+        ("base_fare", FARE_STRUCT),
+        ("surcharge", FARE_STRUCT),
         ("booking_status", pa.string()),
         ("voyage_date", pa.string()),
     ]
@@ -51,13 +70,43 @@ DELETE_SCHEMA = pa.schema(
     ]
 )
 
+NAME_MAPPING = [
+    {"field-id": 1, "names": ["ticket_no"]},
+    {"field-id": 2, "names": ["passenger_name"]},
+    {
+        "field-id": 3,
+        "names": ["base_fare", "legacy_base_fare"],
+        "fields": [
+            {"field-id": 31, "names": ["fare_cents", "amount_cents"]},
+            {"field-id": 32, "names": ["currency"]},
+        ],
+    },
+    {
+        "field-id": 4,
+        "names": ["surcharge", "port_surcharge"],
+        "fields": [
+            {"field-id": 41, "names": ["fare_cents", "amount_cents"]},
+            {"field-id": 42, "names": ["currency"]},
+        ],
+    },
+    {"field-id": 5, "names": ["booking_status"]},
+    {"field-id": 6, "names": ["voyage_date"]},
+]
+
 
 def data_rows(tickets: list[int]) -> list[dict]:
     return [
         {
             "ticket_no": ticket,
             "passenger_name": f"P-{ticket}",
-            "fare_cents": 1500 + (ticket % 700),
+            "base_fare": {
+                "fare_cents": 1500 + (ticket % 700),
+                "currency": "CNY",
+            },
+            "surcharge": {
+                "fare_cents": 100 + (ticket % 90),
+                "currency": "CNY",
+            },
             "booking_status": "checked_in",
             "voyage_date": "2026-11-05",
         }
@@ -118,6 +167,13 @@ def write_manifest() -> None:
     (SAMPLE / "manifest.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_name_mapping() -> None:
+    (SAMPLE / "name-mapping.json").write_text(
+        json.dumps(NAME_MAPPING, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def main() -> None:
     SAMPLE.mkdir(parents=True, exist_ok=True)
     write_data1()
@@ -141,6 +197,7 @@ def main() -> None:
         ],
     )
     write_manifest()
+    write_name_mapping()
 
     for name in (
         "data-0001.parquet",
@@ -149,6 +206,7 @@ def main() -> None:
         "delete-pos-0002.parquet",
         "delete-pos-stale-0001.parquet",
         "manifest.csv",
+        "name-mapping.json",
     ):
         print(f"wrote {SAMPLE / name}")
 
