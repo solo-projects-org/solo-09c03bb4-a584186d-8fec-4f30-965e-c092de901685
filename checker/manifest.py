@@ -2,13 +2,15 @@
 
 Supported input is either CSV or JSON.  Every entry must describe:
 
-* ``original_path`` - the path stored in Iceberg (and in positional delete rows)
-* ``uploaded_filename`` - the name of the uploaded Parquet replica
+* ``original_path`` - the path stored in Iceberg
+* ``uploaded_filename`` - the name of the uploaded Parquet replica (also
+  the entry name used inside the result ZIP)
 * ``file_type`` - data / position delete / equality delete
 * ``data_sequence_number`` - the Iceberg data sequence number of that file
 
-Only data files and *position* delete files become inputs to the checker.
-Equality delete entries are recorded and explicitly ignored.
+Only data files and *position* delete files require Parquet replicas and
+are rewritten by the field-ID backfiller.  Equality delete entries are
+recorded and explicitly ignored.
 """
 
 from __future__ import annotations

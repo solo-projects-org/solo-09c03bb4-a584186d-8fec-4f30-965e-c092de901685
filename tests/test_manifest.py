@@ -13,9 +13,9 @@ SAMPLE = Path(__file__).resolve().parents[1] / "sample"
 
 def test_sample_csv_manifest():
     manifest = parse_manifest((SAMPLE / "manifest.csv").read_bytes())
-    assert len(manifest.entries) == 6
+    assert len(manifest.entries) == 5
     assert len(manifest.data_files) == 2
-    assert len(manifest.position_delete_files) == 3
+    assert len(manifest.position_delete_files) == 2
     assert len(manifest.equality_delete_files) == 1
 
     data1 = manifest.data_files[0]

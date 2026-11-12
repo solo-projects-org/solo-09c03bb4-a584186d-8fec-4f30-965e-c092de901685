@@ -1,21 +1,27 @@
-"""Iceberg v2 positional-delete verification.
+"""Backfill Iceberg field IDs into legacy Parquet replicas.
 
-The engine scans the Parquet replicas of the supplied valid-file manifest.
+The engine rewrites each Parquet replica listed in the valid-file manifest so
+that the Iceberg field IDs from ``schema.name-mapping.default`` are written
+into the Parquet schema metadata.
 
-* Only data files and positional delete files are read.  Equality delete
-  entries are ignored.
-* For a ticket number, each Parquet row group is checked against the
-  ``ticket_no`` column statistics.  A row group is skipped only when its
-  min/max range provably excludes the ticket.  If statistics are missing,
-  the row group is read.
-* Row numbers are always computed from the original Parquet row-group
-  offsets.  Filtering a row group never renumbers rows.
-* A delete record applies only when ``file_path`` equals the manifest's
-  original path, ``pos`` equals the zero-based row index in the data file,
-  and the delete file's data sequence number is >= the data file's.
+Rules implemented here:
 
-Any missing required replica or any read failure aborts the whole check
-with a ``CheckError`` naming the exact file; no partial results are returned.
+* Only scalar columns and one level of ``struct`` are handled.  Lists, maps
+  and nested structs are rejected with the file and column path named.
+* Fields that already carry a valid Parquet field ID are left untouched;
+  fields without an ID are matched against the name mapping **by name and
+  aliases** (the mapping's ``names`` array).  A match must be unique.
+* Struct children are scoped: they are matched inside the mapping node whose
+  ``field-id`` equals the struct's own field ID.
+* Field IDs must be unique within a single output file.
+* Column names, Arrow types, nullability, values and row order are preserved;
+  files are rewritten one row group at a time, keeping row-group boundaries,
+  per-column compression, schema-level key/value metadata and statistics
+  settings.
+* The whole batch is all-or-nothing: every replica is validated before any
+  file is rewritten.  Missing files, ambiguous matches, duplicate IDs or any
+  read/write failure raise a :class:`CheckError` naming the file(s) and
+  column(s) involved, and no download is offered.
 """
 
 from __future__ import annotations
@@ -25,539 +31,522 @@ from pathlib import Path
 from typing import Mapping
 
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from .errors import CheckError
-from .manifest import FileKind, Manifest, ManifestEntry
+from .manifest import Manifest, ManifestEntry
+from .namemapping import MappingNode, NameMapping
 
-DELETE_PATH_COLUMN = "file_path"
-DELETE_POS_COLUMN = "pos"
+FIELD_ID_KEY = b"PARQUET:field_id"
+_UNCOMPRESSED = "UNCOMPRESSED"
+
+
+@dataclass(frozen=True)
+class FieldChange:
+    """One column whose field ID was backfilled in one file."""
+
+    column_path: str
+    field_id: int
+    matched_names: tuple[str, ...]
 
 
 @dataclass
-class DeleteRecord:
+class FilePlan:
     entry: ManifestEntry
-    source_row: int  # zero-based row in the positional delete file
+    source_path: Path
+    output_schema: pa.Schema
+    changes: list[FieldChange]
+    kept_ids: list[tuple[str, int]]
+    compression: dict[str, str]
+    write_statistics: bool
+    num_row_groups: int
 
 
 @dataclass
-class IgnoredDelete:
-    record: DeleteRecord
-    reason: str
-
-
-@dataclass
-class Occurrence:
-    ticket: int
-    file_entry: ManifestEntry
-    row_index: int  # zero-based row in the data file
-    row_group_index: int
-    row_group_start: int  # zero-based first row of that row group
-    local_row_index: int  # zero-based row in the row group
-    matched_deletes: list[DeleteRecord] = field(default_factory=list)
-    ignored_deletes: list[IgnoredDelete] = field(default_factory=list)
-
-    @property
-    def deleted(self) -> bool:
-        return bool(self.matched_deletes)
-
-
-@dataclass
-class RowGroupScan:
-    row_group_index: int
-    start_row: int
-    num_rows: int
-    stats_present: bool
-    stats_min: int | None
-    stats_max: int | None
-    skipped: bool
-    reason: str
-    matched_rows: list[int] = field(default_factory=list)
-
-
-@dataclass
-class FileScan:
-    file_entry: ManifestEntry
-    row_groups: list[RowGroupScan]
-
-    @property
-    def skipped_count(self) -> int:
-        return sum(1 for rg in self.row_groups if rg.skipped)
-
-    @property
-    def read_count(self) -> int:
-        return sum(1 for rg in self.row_groups if not rg.skipped)
-
-    @property
-    def matched_rows(self) -> list[int]:
-        return [row for rg in self.row_groups for row in rg.matched_rows]
-
-
-@dataclass
-class TicketResult:
-    ticket: int
-    occurrences: list[Occurrence]
-    file_scans: list[FileScan]
-
-    @property
-    def found(self) -> bool:
-        return bool(self.occurrences)
-
-    @property
-    def deleted(self) -> bool:
-        return any(o.deleted for o in self.occurrences)
-
-    @property
-    def ignored_deletes(self) -> list[IgnoredDelete]:
-        return [item for o in self.occurrences for item in o.ignored_deletes]
-
-
-@dataclass
-class ManifestRow:
+class FileResult:
     entry: ManifestEntry
-    uploaded: bool
-    note: str = ""
+    output_path: Path
+    changes: list[FieldChange]
+    kept_ids: list[tuple[str, int]]
+    num_row_groups: int
 
 
 @dataclass
-class CheckResult:
+class BackfillResult:
     manifest: Manifest
-    ticket_column: str
-    tickets: list[TicketResult]
-    manifest_rows: list[ManifestRow]
+    file_results: list[FileResult]
     unused_uploads: list[str]
     warnings: list[str] = field(default_factory=list)
 
     @property
-    def data_files(self) -> list[ManifestEntry]:
-        return self.manifest.data_files
+    def total_assigned(self) -> int:
+        return sum(len(fr.changes) for fr in self.file_results)
 
     @property
-    def position_delete_files(self) -> list[ManifestEntry]:
-        return self.manifest.position_delete_files
-
-    @property
-    def equality_delete_files(self) -> list[ManifestEntry]:
-        return self.manifest.equality_delete_files
-
-    @property
-    def found_count(self) -> int:
-        return sum(1 for t in self.tickets if t.found)
-
-    @property
-    def deleted_count(self) -> int:
-        return sum(1 for t in self.tickets if t.deleted)
+    def total_kept(self) -> int:
+        return sum(len(fr.kept_ids) for fr in self.file_results)
 
 
-@dataclass
-class _DataHandle:
-    entry: ManifestEntry
-    path: Path
-    parquet: pq.ParquetFile
-    column_index: int = -1
+# --------------------------------------------------------------------------- #
+# Field-ID helpers
+# --------------------------------------------------------------------------- #
 
 
-def _find_parquet_column(metadata: pq.FileMetaData, name: str) -> int | None:
-    """Return the leaf-column index in row-group metadata for ``name``."""
-    for index in range(metadata.num_columns):
-        if metadata.schema.column(index).path == name:
-            return index
-    return None
+def existing_field_id(arrow_field: pa.Field) -> int | None:
+    """Return the valid Parquet field ID already on a field, else ``None``.
 
-
-def _require_integer_column(
-    schema: pa.Schema, name: str, *, file_label: str, role: str
-) -> pa.DataType:
+    Missing metadata, a non-numeric value or the Parquet sentinel ``-1`` all
+    mean "no Iceberg ID yet": such fields are backfilled rather than trusted.
+    """
+    metadata = arrow_field.metadata
+    if not metadata or FIELD_ID_KEY not in metadata:
+        return None
+    raw = metadata[FIELD_ID_KEY]
     try:
-        field = schema.field(name)
-    except KeyError:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
+def _with_field_id(arrow_field: pa.Field, field_id: int) -> pa.Field:
+    metadata = dict(arrow_field.metadata or {})
+    metadata[FIELD_ID_KEY] = str(field_id).encode("ascii")
+    return pa.field(
+        arrow_field.name,
+        arrow_field.type,
+        nullable=arrow_field.nullable,
+        metadata=metadata,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1: pure schema planning (no files are written)
+# --------------------------------------------------------------------------- #
+
+
+def _unique_match(
+    candidates: list[MappingNode],
+    *,
+    column_path: str,
+    file_label: str,
+    scope_description: str,
+) -> MappingNode:
+    if not candidates:
         raise CheckError(
-            f"{role} “{file_label}” 缺少列 “{name}”。",
+            f"文件 “{file_label}” 的列 “{column_path}” 缺少字段 ID，且在"
+            f"{scope_description}中没有任何映射名称与其匹配。请检查 "
+            "schema.name-mapping.default 是否包含该列或其别名。",
             files=[file_label],
-        ) from None
-    if not pa.types.is_integer(field.type):
-        raise CheckError(
-            f"{role} “{file_label}” 的列 “{name}” 类型为 {field.type}，"
-            "不是整数类型。",
-            files=[file_label],
+            columns=[column_path],
         )
-    return field.type
+    distinct = {node.field_id: node for node in candidates}
+    if len(distinct) > 1:
+        raise CheckError(
+            f"文件 “{file_label}” 的列 “{column_path}” 缺少字段 ID，且在"
+            f"{scope_description}中同时匹配到多个字段 ID："
+            + "、".join(
+                f"{field_id}（名称 {'/'.join(node.names)}）"
+                for field_id, node in sorted(distinct.items())
+            )
+            + "。匹配必须唯一。",
+            files=[file_label],
+            columns=[column_path],
+        )
+    return next(iter(distinct.values()))
 
 
-def _require_string_column(
-    schema: pa.Schema, name: str, *, file_label: str
+def _claim_id(
+    field_id: int, *, column_path: str, file_label: str, used_ids: dict[int, str]
 ) -> None:
-    try:
-        field = schema.field(name)
-    except KeyError:
+    previous = used_ids.get(field_id)
+    if previous is not None and previous != column_path:
         raise CheckError(
-            f"删除文件 “{file_label}” 缺少列 “{name}”。位置删除文件必须包含 "
-            "file_path 和 pos。",
+            f"文件 “{file_label}” 内字段 ID {field_id} 同时出现在列 "
+            f"“{previous}” 和 “{column_path}”，单文件内字段 ID 必须唯一。",
             files=[file_label],
-        ) from None
-    if not (pa.types.is_string(field.type) or pa.types.is_large_string(field.type)):
+            columns=[previous, column_path],
+        )
+    used_ids[field_id] = column_path
+
+
+def _resolve_id(
+    arrow_field: pa.Field,
+    *,
+    column_path: str,
+    file_label: str,
+    scope_nodes: tuple[MappingNode, ...] | None,
+    scope_description: str,
+    used_ids: dict[int, str],
+    changes: list[FieldChange],
+    kept: list[tuple[str, int]],
+) -> tuple[int, pa.Field]:
+    """Return the field ID and a (possibly rewritten) field carrying it."""
+    field_id = existing_field_id(arrow_field)
+    if field_id is not None:
+        _claim_id(
+            field_id,
+            column_path=column_path,
+            file_label=file_label,
+            used_ids=used_ids,
+        )
+        kept.append((column_path, field_id))
+        return field_id, arrow_field
+
+    if not scope_nodes:
         raise CheckError(
-            f"删除文件 “{file_label}” 的列 “{name}” 类型为 {field.type}，"
-            "不是字符串类型。",
+            f"文件 “{file_label}” 的列 “{column_path}” 缺少字段 ID，且在"
+            f"{scope_description}中没有可用于匹配的子映射。",
             files=[file_label],
+            columns=[column_path],
         )
+    node = _unique_match(
+        [candidate for candidate in scope_nodes if arrow_field.name in candidate.names],
+        column_path=column_path,
+        file_label=file_label,
+        scope_description=scope_description,
+    )
+    field_id = node.field_id
+    _claim_id(
+        field_id,
+        column_path=column_path,
+        file_label=file_label,
+        used_ids=used_ids,
+    )
+    changes.append(
+        FieldChange(
+            column_path=column_path,
+            field_id=field_id,
+            matched_names=node.names,
+        )
+    )
+    return field_id, _with_field_id(arrow_field, field_id)
 
 
-def _open_data_files(
-    manifest: Manifest, uploaded_paths: Mapping[str, Path]
-) -> list[_DataHandle]:
-    handles: list[_DataHandle] = []
-    for entry in manifest.data_files:
-        path = uploaded_paths[entry.uploaded_filename]
-        label = entry.uploaded_filename
-        try:
-            parquet = pq.ParquetFile(str(path))
-        except Exception as exc:
+def _plan_scalar(
+    arrow_field: pa.Field,
+    *,
+    column_path: str,
+    file_label: str,
+    scope_nodes: tuple[MappingNode, ...] | None,
+    scope_description: str,
+    used_ids: dict[int, str],
+    changes: list[FieldChange],
+    kept: list[tuple[str, int]],
+) -> pa.Field:
+    if (
+        pa.types.is_list(arrow_field.type)
+        or pa.types.is_large_list(arrow_field.type)
+        or pa.types.is_map(arrow_field.type)
+    ):
+        raise CheckError(
+            f"文件 “{file_label}” 的列 “{column_path}” 类型为 "
+            f"{arrow_field.type}；本工具只处理标量列和一层 struct，"
+            "不支持 list / map。",
+            files=[file_label],
+            columns=[column_path],
+        )
+    _field_id, rewritten = _resolve_id(
+        arrow_field,
+        column_path=column_path,
+        file_label=file_label,
+        scope_nodes=scope_nodes,
+        scope_description=scope_description,
+        used_ids=used_ids,
+        changes=changes,
+        kept=kept,
+    )
+    return rewritten
+
+
+def _plan_struct(
+    arrow_field: pa.Field,
+    *,
+    column_path: str,
+    file_label: str,
+    scope_nodes: tuple[MappingNode, ...] | None,
+    scope_description: str,
+    used_ids: dict[int, str],
+    changes: list[FieldChange],
+    kept: list[tuple[str, int]],
+    name_mapping: NameMapping,
+) -> pa.Field:
+    struct_id, rewritten_struct = _resolve_id(
+        arrow_field,
+        column_path=column_path,
+        file_label=file_label,
+        scope_nodes=scope_nodes,
+        scope_description=scope_description,
+        used_ids=used_ids,
+        changes=changes,
+        kept=kept,
+    )
+
+    # Sub-columns are resolved strictly through the mapping node selected by
+    # the parent struct's own field ID.
+    parent_node = name_mapping.node_by_id(struct_id)
+    child_scope = parent_node.children if parent_node is not None else None
+    child_scope_description = (
+        f"父字段 “{column_path}”（field-id {struct_id}）的子映射"
+    )
+
+    new_children: list[pa.Field] = []
+    for child in arrow_field.type:
+        child_path = f"{column_path}.{child.name}"
+        if pa.types.is_struct(child.type):
             raise CheckError(
-                f"无法读取数据文件 “{label}”（原始路径 {entry.original_path}）："
-                f"{exc}",
-                files=[label],
-            ) from None
-        handles.append(
-            _DataHandle(entry=entry, path=path, parquet=parquet)
+                f"文件 “{file_label}” 的列 “{child_path}” 是嵌套 struct；"
+                "本工具只处理一层 struct。",
+                files=[file_label],
+                columns=[child_path],
+            )
+        new_children.append(
+            _plan_scalar(
+                child,
+                column_path=child_path,
+                file_label=file_label,
+                scope_nodes=child_scope,
+                scope_description=child_scope_description,
+                used_ids=used_ids,
+                changes=changes,
+                kept=kept,
+            )
         )
-    return handles
 
-
-def _bind_ticket_column(
-    handles: list[_DataHandle], ticket_column: str
-) -> None:
-    """Validate the requested ticket column in every data file."""
-    for handle in handles:
-        entry = handle.entry
-        label = entry.uploaded_filename
-        schema = handle.parquet.schema_arrow
-        _require_integer_column(
-            schema, ticket_column, file_label=label, role="数据文件"
-        )
-        column_index = _find_parquet_column(
-            handle.parquet.metadata, ticket_column
-        )
-        if column_index is None:
-            raise CheckError(
-                f"数据文件 “{label}” 的 Parquet 元数据中找不到列 "
-                f"“{ticket_column}”。",
-                files=[label],
+    new_type = pa.struct(
+        [
+            pa.field(
+                child.name,
+                child.type,
+                nullable=child.nullable,
+                metadata=child.metadata,
             )
-        handle.column_index = column_index
+            for child in new_children
+        ]
+    )
+    return pa.field(
+        arrow_field.name,
+        new_type,
+        nullable=arrow_field.nullable,
+        metadata=rewritten_struct.metadata,
+    )
 
 
-def _load_position_deletes(
-    manifest: Manifest, uploaded_paths: Mapping[str, Path]
-) -> dict[tuple[str, int], list[DeleteRecord]]:
-    index: dict[tuple[str, int], list[DeleteRecord]] = {}
-    for entry in manifest.position_delete_files:
-        path = uploaded_paths[entry.uploaded_filename]
-        label = entry.uploaded_filename
-        try:
-            parquet = pq.ParquetFile(str(path))
-            _require_string_column(
-                parquet.schema_arrow, DELETE_PATH_COLUMN, file_label=label
-            )
-            _require_integer_column(
-                parquet.schema_arrow,
-                DELETE_POS_COLUMN,
-                file_label=label,
-                role="删除文件",
-            )
-            table = parquet.read(
-                columns=[DELETE_PATH_COLUMN, DELETE_POS_COLUMN]
-            )
-        except CheckError:
-            raise
-        except Exception as exc:
-            raise CheckError(
-                f"无法读取位置删除文件 “{label}”（原始路径 "
-                f"{entry.original_path}）：{exc}",
-                files=[label],
-            ) from None
-
-        # These files are normally small, and the index has to be complete
-        # before any conclusion is produced.
-        paths = table.column(DELETE_PATH_COLUMN).to_pylist()
-        positions = table.column(DELETE_POS_COLUMN).to_pylist()
-        for row_index, (record_path, record_pos) in enumerate(
-            zip(paths, positions)
-        ):
-            if record_path is None or str(record_path) == "":
-                raise CheckError(
-                    f"位置删除文件 “{label}” 第 {row_index} 行（从 0 起算）"
-                    "的 file_path 为空。",
-                    files=[label],
-                )
-            if not isinstance(record_path, str):
-                raise CheckError(
-                    f"位置删除文件 “{label}” 第 {row_index} 行（从 0 起算）"
-                    "的 file_path 不是字符串。",
-                    files=[label],
-                )
-            if record_pos is None or not isinstance(record_pos, int):
-                raise CheckError(
-                    f"位置删除文件 “{label}” 第 {row_index} 行（从 0 起算）"
-                    "的 pos 不是整数。",
-                    files=[label],
-                )
-            if record_pos < 0:
-                raise CheckError(
-                    f"位置删除文件 “{label}” 第 {row_index} 行（从 0 起算）"
-                    f"的 pos={record_pos} 为负数。",
-                    files=[label],
-                )
-            index.setdefault((record_path, record_pos), []).append(
-                DeleteRecord(entry=entry, source_row=row_index)
-            )
-    return index
+def _compression_map(parquet_file: pq.ParquetFile) -> tuple[dict[str, str], bool]:
+    """Read per-leaf-path compression and whether statistics exist."""
+    metadata = parquet_file.metadata
+    first_group = metadata.row_group(0)
+    compression: dict[str, str] = {}
+    stats_set = False
+    for row_group_index in range(metadata.num_row_groups):
+        group = metadata.row_group(row_group_index)
+        for column_index in range(metadata.num_columns):
+            column = group.column(column_index)
+            codec = str(column.compression)
+            if codec != _UNCOMPRESSED:
+                compression[column.path_in_schema] = codec.lower()
+            if column.is_stats_set:
+                stats_set = True
+    # Keep one reference of every leaf path even when uncompressed.
+    for column_index in range(metadata.num_columns):
+        path = first_group.column(column_index).path_in_schema
+        compression.setdefault(path, "none")
+    return compression, stats_set
 
 
-def _extract_stats(column_metadata) -> tuple[bool, int | None, int | None]:
-    stats = column_metadata.statistics
-    if stats is None or not getattr(stats, "has_min_max", False):
-        return False, None, None
+def _plan_file(
+    entry: ManifestEntry,
+    source_path: Path,
+    name_mapping: NameMapping,
+) -> FilePlan:
+    label = entry.uploaded_filename
     try:
-        minimum = stats.min
-        maximum = stats.max
-        if minimum is None or maximum is None:
-            return False, None, None
-        return True, int(minimum), int(maximum)
-    except (TypeError, ValueError, OverflowError):
-        return False, None, None
-
-
-def _find_local_matches(
-    handle: _DataHandle,
-    row_group_index: int,
-    ticket: int,
-    ticket_column: str,
-    expected_rows: int,
-) -> list[int]:
-    """Read one row group and return original zero-based local row indices."""
-    label = handle.entry.uploaded_filename
-    try:
-        table = handle.parquet.read_row_group(
-            row_group_index, columns=[ticket_column]
-        )
+        parquet_file = pq.ParquetFile(str(source_path))
+        source_schema = parquet_file.schema_arrow
     except Exception as exc:
         raise CheckError(
-            f"读取数据文件 “{label}”（原始路径 "
-            f"{handle.entry.original_path}）的行组 {row_group_index} 失败："
+            f"无法读取 Parquet 文件 “{label}”（原始路径 {entry.original_path}）："
             f"{exc}",
             files=[label],
         ) from None
-    if table.num_rows != expected_rows:
-        raise CheckError(
-            f"数据文件 “{label}” 的行组 {row_group_index} 元数据说 "
-            f"{expected_rows} 行，实际读取 {table.num_rows} 行。无法可靠计算"
-            "文件内行号。",
-            files=[label],
-        )
-    column = table.column(ticket_column)
-    try:
-        mask = pc.equal(column, pa.scalar(ticket, type=column.type))
-        indices = pc.indices_nonzero(mask)
-        return [int(i) for i in indices.to_pylist()]
-    except Exception as exc:
-        raise CheckError(
-            f"数据文件 “{label}” 的行组 {row_group_index} 无法按票号列 "
-            f"“{ticket_column}” 过滤：{exc}",
-            files=[label],
-        ) from None
 
+    changes: list[FieldChange] = []
+    kept: list[tuple[str, int]] = []
+    used_ids: dict[int, str] = {}
+    new_fields: list[pa.Field] = []
 
-def _scan_file(
-    handle: _DataHandle,
-    ticket: int,
-    ticket_column: str,
-    delete_index: Mapping[tuple[str, int], list[DeleteRecord]],
-) -> tuple[FileScan, list[Occurrence]]:
-    file_scan = FileScan(file_entry=handle.entry, row_groups=[])
-    occurrences: list[Occurrence] = []
-    start_row = 0
-
-    try:
-        metadata = handle.parquet.metadata
-    except Exception as exc:  # pragma: no cover - caught during preflight
-        raise CheckError(
-            f"无法读取数据文件 “{handle.entry.uploaded_filename}” 的元数据：{exc}",
-            files=[handle.entry.uploaded_filename],
-        ) from None
-
-    for row_group_index in range(metadata.num_row_groups):
-        row_group = metadata.row_group(row_group_index)
-        num_rows = int(row_group.num_rows)
-        column_meta = row_group.column(handle.column_index)
-        stats_present, stats_min, stats_max = _extract_stats(column_meta)
-
-        if stats_present and (
-            ticket < stats_min or ticket > stats_max
-        ):
-            row_scan = RowGroupScan(
-                row_group_index=row_group_index,
-                start_row=start_row,
-                num_rows=num_rows,
-                stats_present=True,
-                stats_min=stats_min,
-                stats_max=stats_max,
-                skipped=True,
-                reason=(
-                    f"统计范围 [{stats_min}, {stats_max}] 不含票号 {ticket}"
-                ),
+    for arrow_field in source_schema:
+        if pa.types.is_struct(arrow_field.type):
+            new_fields.append(
+                _plan_struct(
+                    arrow_field,
+                    column_path=arrow_field.name,
+                    file_label=label,
+                    scope_nodes=name_mapping.roots,
+                    scope_description="name-mapping 顶层映射",
+                    used_ids=used_ids,
+                    changes=changes,
+                    kept=kept,
+                    name_mapping=name_mapping,
+                )
             )
         else:
-            if stats_present:
-                reason = (
-                    f"统计范围 [{stats_min}, {stats_max}] 含票号 {ticket}，"
-                    "读取行组"
+            new_fields.append(
+                _plan_scalar(
+                    arrow_field,
+                    column_path=arrow_field.name,
+                    file_label=label,
+                    scope_nodes=name_mapping.roots,
+                    scope_description="name-mapping 顶层映射",
+                    used_ids=used_ids,
+                    changes=changes,
+                    kept=kept,
                 )
-            else:
-                reason = "缺失行组统计，读取行组"
-            local_indices = _find_local_matches(
-                handle,
-                row_group_index,
-                ticket,
-                ticket_column,
-                num_rows,
             )
-            global_matches = [start_row + i for i in local_indices]
-            row_scan = RowGroupScan(
-                row_group_index=row_group_index,
-                start_row=start_row,
-                num_rows=num_rows,
-                stats_present=stats_present,
-                stats_min=stats_min,
-                stats_max=stats_max,
-                skipped=False,
-                reason=reason,
-                matched_rows=global_matches,
+
+    output_schema = pa.schema(new_fields, metadata=source_schema.metadata)
+    compression, stats_set = _compression_map(parquet_file)
+
+    return FilePlan(
+        entry=entry,
+        source_path=source_path,
+        output_schema=output_schema,
+        changes=changes,
+        kept_ids=kept,
+        compression=compression,
+        write_statistics=stats_set,
+        num_row_groups=parquet_file.num_row_groups,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2: row-group-preserving rewrite
+# --------------------------------------------------------------------------- #
+
+
+def _rewrite_file(plan: FilePlan, output_dir: Path) -> FileResult:
+    label = plan.entry.uploaded_filename
+    output_path = output_dir / label
+    try:
+        source = pq.ParquetFile(str(plan.source_path))
+        with pq.ParquetWriter(
+            str(output_path),
+            plan.output_schema,
+            compression=plan.compression,
+            write_statistics=plan.write_statistics,
+        ) as writer:
+            for row_group_index in range(source.num_row_groups):
+                chunk = source.read_row_group(row_group_index)
+                writer.write_table(chunk.cast(plan.output_schema))
+    except CheckError:
+        raise
+    except Exception as exc:
+        if output_path.exists():
+            output_path.unlink(missing_ok=True)
+        raise CheckError(
+            f"重写 Parquet 文件 “{label}” 失败：{exc}",
+            files=[label],
+            columns=[change.column_path for change in plan.changes],
+        ) from None
+
+    try:
+        rewritten = pq.ParquetFile(str(output_path))
+        if rewritten.num_row_groups != plan.num_row_groups:
+            raise CheckError(
+                f"重写后的文件 “{label}” 行组数量由 {plan.num_row_groups} 变为 "
+                f"{rewritten.num_row_groups}，已中止。",
+                files=[label],
             )
-            if local_indices:
-                for local_index in local_indices:
-                    row_index = start_row + local_index
-                    occurrence = Occurrence(
-                        ticket=ticket,
-                        file_entry=handle.entry,
-                        row_index=row_index,
-                        row_group_index=row_group_index,
-                        row_group_start=start_row,
-                        local_row_index=local_index,
-                    )
-                    for record in delete_index.get(
-                        (handle.entry.original_path, row_index), []
-                    ):
-                        if (
-                            record.entry.sequence_number
-                            >= handle.entry.sequence_number
-                        ):
-                            occurrence.matched_deletes.append(record)
-                        else:
-                            occurrence.ignored_deletes.append(
-                                IgnoredDelete(
-                                    record=record,
-                                    reason=(
-                                        "删除文件的数据序列号 "
-                                        f"{record.entry.sequence_number} 小于"
-                                        "数据文件的 "
-                                        f"{handle.entry.sequence_number}"
-                                    ),
-                                )
-                            )
-                    occurrences.append(occurrence)
+        if rewritten.metadata.num_rows != source.metadata.num_rows:
+            raise CheckError(
+                f"重写后的文件 “{label}” 行数发生变化，已中止。",
+                files=[label],
+            )
+    except CheckError:
+        raise
+    except Exception as exc:
+        raise CheckError(
+            f"无法校验重写后的文件 “{label}”：{exc}", files=[label]
+        ) from None
 
-        file_scan.row_groups.append(row_scan)
-        start_row += num_rows
-
-    return file_scan, occurrences
+    return FileResult(
+        entry=plan.entry,
+        output_path=output_path,
+        changes=list(plan.changes),
+        kept_ids=list(plan.kept_ids),
+        num_row_groups=plan.num_row_groups,
+    )
 
 
-def _check_presence(
+# --------------------------------------------------------------------------- #
+# Orchestration
+# --------------------------------------------------------------------------- #
+
+
+def check_presence(
     manifest: Manifest, uploaded_paths: Mapping[str, Path]
 ) -> None:
-    missing: list[str] = []
-    for entry in manifest.required_entries:
-        path = uploaded_paths.get(entry.uploaded_filename)
-        if path is None or not Path(path).is_file():
-            missing.append(entry.uploaded_filename)
+    missing = [
+        entry.uploaded_filename
+        for entry in manifest.required_entries
+        if entry.uploaded_filename not in uploaded_paths
+        or not Path(uploaded_paths[entry.uploaded_filename]).is_file()
+    ]
     if missing:
         raise CheckError(
-            "清单中以下文件的上传副本缺失，无法给出结论。",
+            "清单中以下文件的上传副本缺失，无法回填字段 ID。",
             files=missing,
         )
 
 
-def run_check(
+def run_backfill(
     manifest: Manifest,
     uploaded_paths: Mapping[str, Path],
-    tickets: list[int],
-    ticket_column: str = "ticket_no",
-) -> CheckResult:
-    """Run the all-or-nothing check.
+    name_mapping: NameMapping,
+    output_dir: Path,
+) -> BackfillResult:
+    """Validate every replica first, then rewrite the whole batch.
 
-    ``uploaded_paths`` maps the manifest's ``uploaded_filename`` values to
-    local Parquet replica paths.  Tickets are checked independently; each
-    result includes every occurrence and the row-group pruning diagnostics.
+    ``output_dir`` must be an empty directory reserved for this request.
+    Output files keep the manifest's ``uploaded_filename`` so that the ZIP
+    can restore the original names.
     """
-    if not tickets:
-        raise CheckError("没有可核对的票号。")
-    if not ticket_column:
-        raise CheckError("票号列名不能为空。")
-    if not manifest.data_files:
-        raise CheckError(
-            "清单中没有 data 类型的数据文件，无法核对票号。"
+    check_presence(manifest, uploaded_paths)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Phase 1: nothing is written until every file passes planning.
+    plans: list[FilePlan] = []
+    for entry in manifest.required_entries:
+        plans.append(
+            _plan_file(entry, uploaded_paths[entry.uploaded_filename], name_mapping)
         )
 
-    _check_presence(manifest, uploaded_paths)
-    data_handles = _open_data_files(manifest, uploaded_paths)
-    _bind_ticket_column(data_handles, ticket_column)
-    delete_index = _load_position_deletes(manifest, uploaded_paths)
+    # Phase 2: all plans are sound; rewrite one file at a time.
+    results: list[FileResult] = []
+    for plan in plans:
+        results.append(_rewrite_file(plan, output_dir))
 
     referenced = {entry.uploaded_filename for entry in manifest.entries}
     unused_uploads = sorted(
         name for name in uploaded_paths if name not in referenced
     )
-
-    results: list[TicketResult] = []
-    for ticket in dict.fromkeys(tickets):
-        file_scans: list[FileScan] = []
-        occurrences: list[Occurrence] = []
-        for handle in data_handles:
-            scan, file_occurrences = _scan_file(
-                handle, ticket, ticket_column, delete_index
-            )
-            file_scans.append(scan)
-            occurrences.extend(file_occurrences)
-        results.append(
-            TicketResult(
-                ticket=ticket,
-                occurrences=occurrences,
-                file_scans=file_scans,
-            )
-        )
-
-    rows: list[ManifestRow] = []
-    for entry in manifest.entries:
-        uploaded = entry.uploaded_filename in uploaded_paths
-        note = ""
-        if entry.kind is FileKind.EQUALITY_DELETE:
-            note = "仅处理位置删除，此文件已忽略"
-        rows.append(ManifestRow(entry=entry, uploaded=uploaded, note=note))
-
     warnings: list[str] = []
     if unused_uploads:
         warnings.append(
-            "以下上传文件未出现在清单中，已忽略："
-            + "、".join(unused_uploads)
+            "以下上传文件未出现在清单中，已忽略：" + "、".join(unused_uploads)
+        )
+    if manifest.equality_delete_files:
+        warnings.append(
+            "清单中的 equality_delete 条目按规则忽略，未要求其副本、也未重写："
+            + "、".join(entry.uploaded_filename for entry in manifest.equality_delete_files)
         )
 
-    return CheckResult(
+    return BackfillResult(
         manifest=manifest,
-        ticket_column=ticket_column,
-        tickets=results,
-        manifest_rows=rows,
+        file_results=results,
         unused_uploads=unused_uploads,
         warnings=warnings,
     )

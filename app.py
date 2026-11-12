@@ -1,22 +1,32 @@
-"""Flask front end for the Iceberg positional-delete checker."""
+"""Flask front end for the Iceberg Parquet field-ID backfiller.
+
+The page accepts a valid-file manifest in the existing CSV/JSON format, the
+Parquet replicas named in that manifest, and the JSON text of the table
+property ``schema.name-mapping.default``.  On success the whole batch is
+rewritten and streamed back as a ZIP whose entries keep the original
+uploaded file names.  Any failure renders the offending file(s) and
+column(s) and never offers a download.
+"""
 
 from __future__ import annotations
 
 import os
-import re
+import shutil
 import tempfile
+import zipfile
 from pathlib import Path
 
-from flask import Flask, render_template, request
+from flask import Flask, g, render_template, request, send_file
 
-from checker.engine import CheckResult, run_check
+from checker.engine import BackfillResult, run_backfill
 from checker.errors import CheckError
 from checker.manifest import parse_manifest
+from checker.namemapping import parse_name_mapping
 
 ROOT = Path(__file__).resolve().parent
 SAMPLE_DIR = ROOT / "sample"
-SAMPLE_TICKETS = "4242, 1003, 4218, 8888, 9999"
-SAMPLE_TICKET_COLUMN = "ticket_no"
+SAMPLE_MAPPING_PATH = SAMPLE_DIR / "name-mapping.json"
+ZIP_NAME = "field-ids-backfill.zip"
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = (
@@ -24,20 +34,30 @@ app.config["MAX_CONTENT_LENGTH"] = (
 )
 
 
-def parse_tickets(text: str) -> list[int]:
-    tokens = [
-        token
-        for token in re.split(r"[,\s，、;；]+", (text or "").strip())
-        if token
-    ]
-    if not tokens:
-        raise CheckError("请输入至少一个整数票号。")
-    tickets: list[int] = []
-    for token in tokens:
-        if not re.fullmatch(r"[+-]?\d+", token):
-            raise CheckError(f"票号 “{token}” 不是整数。")
-        tickets.append(int(token))
-    return tickets
+@app.teardown_appcontext
+def _cleanup_temp_dirs(_error=None):
+    """Remove every temp directory created during this request.
+
+    Registered on ``g`` so that the cleanup runs once the application
+    context pops, i.e. after the response (including a streamed file
+    download) has been handed to the WSGI server.
+    """
+    temp_dirs = getattr(g, "_field_id_temp_dirs", None)
+    if not temp_dirs:
+        return
+    for temp_dir in temp_dirs:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    temp_dirs.clear()
+
+
+def _new_temp_dir() -> Path:
+    temp_dir = Path(tempfile.mkdtemp(prefix="iceberg-field-id-"))
+    g.setdefault("_field_id_temp_dirs", []).append(temp_dir)
+    return temp_dir
+
+
+def _sample_mapping_text() -> str:
+    return SAMPLE_MAPPING_PATH.read_text(encoding="utf-8")
 
 
 def _save_uploads(file_storages, temp_dir: Path) -> dict[str, Path]:
@@ -69,31 +89,49 @@ def _save_uploads(file_storages, temp_dir: Path) -> dict[str, Path]:
 
 def _sample_uploaded_paths(manifest) -> dict[str, Path]:
     paths: dict[str, Path] = {}
+    missing: list[str] = []
     for entry in manifest.required_entries:
         candidate = SAMPLE_DIR / entry.uploaded_filename
         if candidate.is_file():
             paths[entry.uploaded_filename] = candidate
+        else:
+            missing.append(entry.uploaded_filename)
+    if missing:
+        raise CheckError(
+            "内置样例缺少以下 Parquet 副本：" + "、".join(missing),
+            files=missing,
+        )
     return paths
+
+
+def _build_zip(output_dir: Path, zip_path: Path, ordered_names: list[str]) -> None:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name in ordered_names:
+            child = output_dir / name
+            if child.is_file():
+                # arcname is the original uploaded file name.
+                archive.write(child, arcname=name)
 
 
 def _render(
     *,
-    result: CheckResult | None = None,
     error: CheckError | None = None,
-    tickets_text: str = "",
-    ticket_column: str = "ticket_no",
+    mapping_text: str = "",
     source: str = "",
+    sample_manifest=None,
     status: int = 200,
 ):
+    sample_mapping = ""
+    if source == "sample" and sample_manifest is None:
+        sample_mapping = _sample_mapping_text()
     return (
         render_template(
             "index.html",
-            result=result,
             error=error,
-            tickets_text=tickets_text,
-            ticket_column=ticket_column,
+            mapping_text=mapping_text,
             source=source,
-            sample_tickets=SAMPLE_TICKETS,
+            sample_mapping=sample_mapping,
+            sample_manifest=sample_manifest,
             max_upload_mb=app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024),
         ),
         status,
@@ -111,70 +149,112 @@ def healthz():
 
 
 @app.get("/sample")
-def sample():
+def sample_page():
+    """Prefill the form with the bundled manifest and name mapping."""
     try:
         manifest = parse_manifest((SAMPLE_DIR / "manifest.csv").read_bytes())
-        result = run_check(
-            manifest,
-            _sample_uploaded_paths(manifest),
-            parse_tickets(SAMPLE_TICKETS),
-            SAMPLE_TICKET_COLUMN,
-        )
+        mapping_text = _sample_mapping_text()
+        # Validate the bundled sample up front so the page can explain it.
+        parse_name_mapping(mapping_text)
     except CheckError as exc:
-        return _render(
-            error=exc,
-            tickets_text=SAMPLE_TICKETS,
-            ticket_column=SAMPLE_TICKET_COLUMN,
-            source="sample",
-            status=400,
-        )
+        return _render(error=exc, source="sample", status=500)
     return _render(
-        result=result,
-        tickets_text=SAMPLE_TICKETS,
-        ticket_column=SAMPLE_TICKET_COLUMN,
+        mapping_text=mapping_text,
         source="sample",
+        sample_manifest=manifest,
     )
 
 
-@app.post("/check")
-def check():
-    tickets_text = request.form.get("tickets", "")
-    ticket_column = request.form.get("ticket_column", "ticket_no").strip()
+def _run_and_zip(
+    *,
+    manifest,
+    uploaded_paths: dict[str, Path],
+    mapping_text: str,
+):
+    name_mapping = parse_name_mapping(mapping_text)
+    temp_root = _new_temp_dir()
+    output_dir = temp_root / "out"
+    output_dir.mkdir()
+    result: BackfillResult = run_backfill(
+        manifest, uploaded_paths, name_mapping, output_dir
+    )
+    zip_path = temp_root / ZIP_NAME
+    ordered_names = [
+        file_result.entry.uploaded_filename
+        for file_result in result.file_results
+    ]
+    _build_zip(output_dir, zip_path, ordered_names)
+
+    response = send_file(
+        zip_path,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=ZIP_NAME,
+    )
+    # Summary headers let tests/clients verify the batch without unzipping.
+    response.headers["X-Files-Rewritten"] = str(len(result.file_results))
+    response.headers["X-Field-Ids-Assigned"] = str(result.total_assigned)
+    response.headers["X-Field-Ids-Kept"] = str(result.total_kept)
+    return response
+
+
+@app.post("/backfill")
+def backfill():
+    mapping_text = request.form.get("name_mapping", "")
+    source = request.form.get("source", "upload")
+
+    if source == "sample":
+        try:
+            manifest = parse_manifest((SAMPLE_DIR / "manifest.csv").read_bytes())
+            uploaded_paths = _sample_uploaded_paths(manifest)
+            return _run_and_zip(
+                manifest=manifest,
+                uploaded_paths=uploaded_paths,
+                mapping_text=mapping_text,
+            )
+        except CheckError as exc:
+            return _render(
+                error=exc,
+                mapping_text=mapping_text,
+                source="sample",
+                status=400,
+            )
+
     manifest_file = request.files.get("manifest")
     parquet_files = request.files.getlist("files")
-
     if manifest_file is None or not manifest_file.filename:
         return _render(
-            error=CheckError("请上传 Iceberg v2 有效文件清单（CSV 或 JSON）。"),
-            tickets_text=tickets_text,
-            ticket_column=ticket_column,
+            error=CheckError("请上传 Iceberg 有效文件清单（CSV 或 JSON）。"),
+            mapping_text=mapping_text,
             source="upload",
             status=400,
         )
 
     try:
-        tickets = parse_tickets(tickets_text)
         manifest = parse_manifest(manifest_file.read())
-        with tempfile.TemporaryDirectory(prefix="iceberg-pos-delete-") as temp:
-            uploaded_paths = _save_uploads(parquet_files, Path(temp))
-            result = run_check(
-                manifest, uploaded_paths, tickets, ticket_column
-            )
     except CheckError as exc:
         return _render(
             error=exc,
-            tickets_text=tickets_text,
-            ticket_column=ticket_column,
+            mapping_text=mapping_text,
             source="upload",
             status=400,
         )
 
-    return _render(
-        result=result,
-        tickets_text=tickets_text,
-        ticket_column=ticket_column,
-        source="upload",
-    )
+    temp_root = _new_temp_dir()
+    try:
+        uploaded_paths = _save_uploads(parquet_files, temp_root)
+        return _run_and_zip(
+            manifest=manifest,
+            uploaded_paths=uploaded_paths,
+            mapping_text=mapping_text,
+        )
+    except CheckError as exc:
+        return _render(
+            error=exc,
+            mapping_text=mapping_text,
+            source="upload",
+            status=400,
+        )
 
 
 @app.errorhandler(413)

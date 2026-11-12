@@ -1,305 +1,743 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from checker.engine import run_check
+from checker.engine import existing_field_id, run_backfill
 from checker.errors import CheckError
 from checker.manifest import parse_manifest
+from checker.namemapping import parse_name_mapping
 
 SAMPLE = Path(__file__).resolve().parents[1] / "sample"
-BASE = "s3://ferry-lake/warehouse/settlement/voyage_date=2026-11-05"
 
 
-def sample_inputs():
-    manifest = parse_manifest((SAMPLE / "manifest.csv").read_bytes())
-    uploads = {
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+
+def write_parquet(path: Path, fields: list[pa.Field], rows: list[dict], **kwargs):
+    schema = pa.schema(fields)
+    table = pa.Table.from_pylist(rows, schema=schema)
+    pq.write_table(table, path, **kwargs)
+
+
+def field_ids(schema: pa.Schema) -> dict[str, int | None]:
+    found: dict[str, int | None] = {}
+
+    def walk(type_: pa.DataType, prefix: str = ""):
+        for child in type_:
+            path = f"{prefix}{child.name}"
+            found[path] = existing_field_id(child)
+            if pa.types.is_struct(child.type):
+                walk(child.type, path + ".")
+
+    walk(schema)
+    return found
+
+
+def make_manifest(tmp_path: Path, entries: list[tuple[str, str, str, int]]):
+    lines = [
+        "original_path,uploaded_filename,file_type,data_sequence_number"
+    ]
+    for original, uploaded, kind, seq in entries:
+        lines.append(f"{original},{uploaded},{kind},{seq}")
+    manifest_path = tmp_path / "manifest.csv"
+    manifest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return parse_manifest(manifest_path.read_bytes())
+
+
+def sample_mapping() -> str:
+    return (SAMPLE / "name-mapping.json").read_text(encoding="utf-8")
+
+
+def sample_manifest():
+    return parse_manifest((SAMPLE / "manifest.csv").read_bytes())
+
+
+# --------------------------------------------------------------------------- #
+# Field-ID extraction
+# --------------------------------------------------------------------------- #
+
+
+def test_existing_field_id_reads_valid_metadata():
+    field = pa.field("a", pa.int64(), metadata={b"PARQUET:field_id": b"7"})
+    assert existing_field_id(field) == 7
+
+
+@pytest.mark.parametrize("raw", [b"abc", b"-1", b""])
+def test_existing_field_id_treats_invalid_and_sentinel_as_missing(raw):
+    field = pa.field("a", pa.int64(), metadata={b"PARQUET:field_id": raw})
+    assert existing_field_id(field) is None
+
+
+def test_existing_field_id_without_metadata_is_none():
+    assert existing_field_id(pa.field("a", pa.int64())) is None
+
+
+# --------------------------------------------------------------------------- #
+# Happy path
+# --------------------------------------------------------------------------- #
+
+
+def test_sample_batch_assigns_scoped_struct_ids_and_preserves_everything(tmp_path):
+    manifest = sample_manifest()
+    mapping = parse_name_mapping(sample_mapping())
+    paths = {
         entry.uploaded_filename: SAMPLE / entry.uploaded_filename
         for entry in manifest.required_entries
     }
-    return manifest, uploads
+    out = tmp_path / "out"
+    result = run_backfill(manifest, paths, mapping, out)
+
+    # Every required replica is rewritten under its original uploaded name.
+    assert sorted(fr.entry.uploaded_filename for fr in result.file_results) == [
+        "data-0001.parquet",
+        "data-0002.parquet",
+        "delete-pos-0001.parquet",
+        "delete-pos-0002.parquet",
+    ]
+
+    data1 = pq.ParquetFile(out / "data-0001.parquet")
+    ids = field_ids(data1.schema_arrow)
+    assert ids["ticket_no"] == 1  # pre-existing ID is kept
+    assert ids["passenger_name"] == 2
+    assert ids["deck_fare"] == 20
+    assert ids["deck_fare.amount"] == 21
+    assert ids["deck_fare.currency"] == 22
+    assert ids["cabin_fare"] == 30
+    # Same leaf name "amount" must resolve to a different ID via parent scope.
+    assert ids["cabin_fare.amount"] == 31
+    assert ids["cabin_fare.currency"] == 32
+    assert ids["fare_note"] == 5  # matched through the "remark" alias
+    assert ids["voyage_date"] == 6
+
+    delete1 = pq.ParquetFile(out / "delete-pos-0001.parquet")
+    delete_ids = field_ids(delete1.schema_arrow)
+    assert delete_ids == {"file_path": 41, "pos": 42}
 
 
-def test_target_lives_in_later_row_group_and_delete_is_matched():
-    manifest, uploads = sample_inputs()
-    result = run_check(manifest, uploads, [4242])
-    ticket = result.tickets[0]
+def test_rewrite_preserves_values_row_order_types_and_row_groups(tmp_path):
+    manifest = sample_manifest()
+    mapping = parse_name_mapping(sample_mapping())
+    paths = {
+        entry.uploaded_filename: SAMPLE / entry.uploaded_filename
+        for entry in manifest.required_entries
+    }
+    out = tmp_path / "out"
+    run_backfill(manifest, paths, mapping, out)
 
-    assert ticket.found and ticket.deleted
-    occurrence = ticket.occurrences[0]
-    assert occurrence.file_entry.uploaded_filename == "data-0001.parquet"
-    # Zero-based row in the whole file, not in the row group or filtered table.
-    assert occurrence.row_index == 99
-    assert occurrence.row_group_index == 4
-    assert occurrence.row_group_start == 80
-    assert occurrence.local_row_index == 19
+    for entry in manifest.required_entries:
+        name = entry.uploaded_filename
+        before = pq.ParquetFile(SAMPLE / name)
+        after = pq.ParquetFile(out / name)
+        assert after.num_row_groups == before.num_row_groups
+        assert after.metadata.num_rows == before.metadata.num_rows
+        source_table = pq.read_table(SAMPLE / name)
+        output_table = pq.read_table(out / name)
+        assert output_table.equals(source_table)
+        # Types and column order/names survive.
+        assert [f.name for f in output_table.schema] == [
+            f.name for f in source_table.schema
+        ]
+        assert [f.type for f in output_table.schema] == [
+            f.type for f in source_table.schema
+        ]
 
-    matched = occurrence.matched_deletes
-    assert len(matched) == 1
-    assert matched[0].entry.uploaded_filename == "delete-pos-0001.parquet"
-    assert matched[0].entry.sequence_number == 12
-    assert matched[0].source_row == 1
 
-    # The earlier row groups were skipped by statistics, yet the row number
-    # remains the original 99.
-    scan = next(
-        s for s in ticket.file_scans
-        if s.file_entry.uploaded_filename == "data-0001.parquet"
+def test_rewrite_preserves_compression_and_statistics(tmp_path):
+    manifest = sample_manifest()
+    mapping = parse_name_mapping(sample_mapping())
+    paths = {
+        entry.uploaded_filename: SAMPLE / entry.uploaded_filename
+        for entry in manifest.required_entries
+    }
+    out = tmp_path / "out"
+    run_backfill(manifest, paths, mapping, out)
+
+    name = "data-0002.parquet"  # mixed compression + statistics disabled
+    before = pq.ParquetFile(SAMPLE / name).metadata
+    after = pq.ParquetFile(out / name).metadata
+    assert after.num_columns == before.num_columns
+    for index in range(before.num_columns):
+        c1 = before.row_group(0).column(index)
+        c2 = after.row_group(0).column(index)
+        assert c2.path_in_schema == c1.path_in_schema
+        assert c2.compression == c1.compression
+        assert c2.is_stats_set == c1.is_stats_set
+
+
+def test_thrift_schema_carries_field_ids_for_struct_children(tmp_path):
+    manifest = sample_manifest()
+    mapping = parse_name_mapping(sample_mapping())
+    paths = {
+        entry.uploaded_filename: SAMPLE / entry.uploaded_filename
+        for entry in manifest.required_entries
+    }
+    out = tmp_path / "out"
+    run_backfill(manifest, paths, mapping, out)
+    raw = pq.ParquetFile(out / "data-0001.parquet").schema
+    text = str(raw)
+    assert "field_id=20 deck_fare" in text
+    assert "field_id=21 amount" in text
+    assert "field_id=31 amount" in text
+
+
+def test_schema_kv_metadata_and_nullability_are_preserved(tmp_path):
+    inner = pa.struct(
+        [
+            pa.field("amount", pa.int64(), nullable=False),
+            pa.field("currency", pa.string()),
+        ]
     )
-    assert [rg.row_group_index for rg in scan.row_groups if rg.skipped] == [
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("fare", inner),
+        ],
+        metadata={b"iceberg.schema": b'{"schema-id":3}', b"custom.kv": b"v1"},
+    )
+    rows = [
+        {"id": i, "fare": {"amount": 100 + i, "currency": "CNY"}}
+        for i in range(4)
+    ]
+    source = tmp_path / "a.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=schema), source, row_group_size=2
+    )
+    mapping = parse_name_mapping(
+        json.dumps(
+            [
+                {"field-id": 1, "names": ["id"]},
+                {
+                    "field-id": 10,
+                    "names": ["fare"],
+                    "fields": [
+                        {"field-id": 11, "names": ["amount"]},
+                        {"field-id": 12, "names": ["currency"]},
+                    ],
+                },
+            ]
+        )
+    )
+    manifest = make_manifest(
+        tmp_path, [("s3://b/a.parquet", "a.parquet", "data", 1)]
+    )
+    out = tmp_path / "out"
+    run_backfill(manifest, {"a.parquet": source}, mapping, out)
+
+    rewritten = pq.ParquetFile(out / "a.parquet")
+    new_schema = rewritten.schema_arrow
+    assert new_schema.metadata == schema.metadata
+    assert new_schema.field("id").nullable is False
+    fare = new_schema.field("fare")
+    assert fare.type.field("amount").nullable is False
+    assert fare.type.field("currency").nullable is True
+    assert rewritten.num_row_groups == 2
+    assert pq.read_table(out / "a.parquet").column("id").to_pylist() == [
         0,
         1,
         2,
         3,
     ]
-    assert scan.read_count == 1
-    assert scan.row_groups[4].matched_rows == [99]
 
 
-def test_stale_delete_file_is_ignored_because_sequence_is_lower():
-    manifest, uploads = sample_inputs()
-    result = run_check(manifest, uploads, [4242])
-    occurrence = result.tickets[0].occurrences[0]
+def test_backfill_is_idempotent(tmp_path):
+    manifest = sample_manifest()
+    mapping = parse_name_mapping(sample_mapping())
+    paths = {
+        entry.uploaded_filename: SAMPLE / entry.uploaded_filename
+        for entry in manifest.required_entries
+    }
+    first = tmp_path / "first"
+    result1 = run_backfill(manifest, paths, mapping, first)
+    assert result1.total_assigned > 0
 
-    assert occurrence.deleted
-    assert [m.entry.uploaded_filename for m in occurrence.matched_deletes] == [
-        "delete-pos-0001.parquet"
+    second_paths = {
+        entry.uploaded_filename: first / entry.uploaded_filename
+        for entry in manifest.required_entries
+    }
+    second = tmp_path / "second"
+    result2 = run_backfill(manifest, second_paths, mapping, second)
+    assert result2.total_assigned == 0
+    assert result2.total_kept == result1.total_kept + result1.total_assigned
+    for entry in manifest.required_entries:
+        name = entry.uploaded_filename
+        assert pq.read_table(first / name).equals(pq.read_table(second / name))
+
+
+# --------------------------------------------------------------------------- #
+# Scoped matching rules
+# --------------------------------------------------------------------------- #
+
+
+def test_struct_child_uses_parent_scope_not_global_names(tmp_path):
+    # Two structs each with "amount"; only the parent-scoped mapping exists.
+    # A global mapping containing "amount" must not be consulted.
+    fields = [
+        pa.field("id", pa.int64()),
+        pa.field(
+            "deck_fare",
+            pa.struct([pa.field("amount", pa.int64())]),
+        ),
+        pa.field(
+            "cabin_fare",
+            pa.struct([pa.field("amount", pa.int64())]),
+        ),
     ]
-    assert [
-        ignored.record.entry.uploaded_filename
-        for ignored in occurrence.ignored_deletes
-    ] == ["delete-pos-stale-0001.parquet"]
-    assert "小于" in occurrence.ignored_deletes[0].reason
-
-
-def test_missing_statistics_cause_row_groups_to_be_read():
-    manifest, uploads = sample_inputs()
-    result = run_check(manifest, uploads, [8888])
-    ticket = result.tickets[0]
-
-    assert ticket.found and ticket.deleted
-    occurrence = ticket.occurrences[0]
-    assert occurrence.file_entry.uploaded_filename == "data-0002.parquet"
-    assert occurrence.row_index == 19
-    assert occurrence.row_group_index == 1
-    assert occurrence.row_group_start == 10
-
-    scan = next(
-        s for s in ticket.file_scans
-        if s.file_entry.uploaded_filename == "data-0002.parquet"
+    rows = [
+        {"id": 1, "deck_fare": {"amount": 10}, "cabin_fare": {"amount": 20}}
+    ]
+    source = tmp_path / "a.parquet"
+    write_parquet(source, fields, rows)
+    mapping = parse_name_mapping(
+        json.dumps(
+            [
+                {"field-id": 1, "names": ["id"]},
+                {
+                    "field-id": 20,
+                    "names": ["deck_fare"],
+                    "fields": [{"field-id": 21, "names": ["amount"]}],
+                },
+                {
+                    "field-id": 30,
+                    "names": ["cabin_fare"],
+                    "fields": [{"field-id": 31, "names": ["amount"]}],
+                },
+            ]
+        )
     )
-    assert scan.read_count == 2
-    assert all(not rg.stats_present for rg in scan.row_groups)
-    assert all(not rg.skipped for rg in scan.row_groups)
-    assert all("缺失行组统计" in rg.reason for rg in scan.row_groups)
-
-
-def test_first_row_group_and_row_number():
-    manifest, uploads = sample_inputs()
-    result = run_check(manifest, uploads, [1003])
-    occurrence = result.tickets[0].occurrences[0]
-    assert occurrence.row_index == 3
-    assert occurrence.row_group_index == 0
-    assert occurrence.deleted
-    assert occurrence.matched_deletes[0].source_row == 0
-
-
-def test_present_but_not_deleted():
-    manifest, uploads = sample_inputs()
-    result = run_check(manifest, uploads, [4218])
-    ticket = result.tickets[0]
-    assert ticket.found and not ticket.deleted
-    assert ticket.occurrences[0].row_index == 98
-
-
-def test_ticket_not_found():
-    manifest, uploads = sample_inputs()
-    result = run_check(manifest, uploads, [9999])
-    ticket = result.tickets[0]
-    assert not ticket.found
-    assert ticket.occurrences == []
-
-
-def test_equality_delete_entry_is_ignored():
-    manifest, uploads = sample_inputs()
-    result = run_check(manifest, uploads, [4242])
-    assert len(result.equality_delete_files) == 1
-    assert result.equality_delete_files[0].uploaded_filename == (
-        "delete-eq-0001.parquet"
+    manifest = make_manifest(
+        tmp_path,
+        [("s3://b/a.parquet", "a.parquet", "data", 1)],
     )
-    # No equality delete replica was supplied; the check still succeeds.
-    assert "delete-eq-0001.parquet" not in uploads
+    out = tmp_path / "out"
+    run_backfill(manifest, {"a.parquet": source}, mapping, out)
+    ids = field_ids(pq.ParquetFile(out / "a.parquet").schema_arrow)
+    assert ids["deck_fare.amount"] == 21
+    assert ids["cabin_fare.amount"] == 31
 
 
-def test_missing_replica_aborts_with_file_name():
-    manifest, uploads = sample_inputs()
-    del uploads["data-0002.parquet"]
-    with pytest.raises(CheckError) as excinfo:
-        run_check(manifest, uploads, [4242])
-    assert "data-0002.parquet" in excinfo.value.files
-    assert "缺失" in excinfo.value.message
+def test_alias_matches_when_parquet_name_differs(tmp_path):
+    source = tmp_path / "a.parquet"
+    write_parquet(
+        source,
+        [pa.field("remark", pa.string())],
+        [{"remark": "x"}],
+    )
+    mapping = parse_name_mapping(
+        json.dumps([{"field-id": 5, "names": ["fare_note", "remark"]}])
+    )
+    manifest = make_manifest(
+        tmp_path, [("s3://b/a.parquet", "a.parquet", "data", 1)]
+    )
+    out = tmp_path / "out"
+    result = run_backfill(manifest, {"a.parquet": source}, mapping, out)
+    assert result.file_results[0].changes[0].field_id == 5
+    assert pq.ParquetFile(out / "a.parquet").schema_arrow.field(
+        "remark"
+    ).metadata[b"PARQUET:field_id"] == b"5"
 
 
-def test_corrupt_data_file_aborts_with_file_name(tmp_path: Path):
+def test_unmatched_column_names_file_and_column(tmp_path):
+    source = tmp_path / "a.parquet"
+    write_parquet(source, [pa.field("ghost", pa.string())], [{"ghost": "x"}])
+    mapping = parse_name_mapping(
+        json.dumps([{"field-id": 1, "names": ["other"]}])
+    )
+    manifest = make_manifest(
+        tmp_path, [("s3://b/a.parquet", "a.parquet", "data", 1)]
+    )
+    with pytest.raises(CheckError) as exc_info:
+        run_backfill(
+            manifest,
+            {"a.parquet": source},
+            mapping,
+            tmp_path / "out",
+        )
+    assert exc_info.value.files == ["a.parquet"]
+    assert exc_info.value.columns == ["ghost"]
+    assert not (tmp_path / "out").exists() or not any(
+        (tmp_path / "out").iterdir()
+    )
+
+
+def test_ambiguous_top_level_match_is_rejected(tmp_path):
+    source = tmp_path / "a.parquet"
+    write_parquet(source, [pa.field("shared", pa.int64())], [{"shared": 1}])
+    mapping = parse_name_mapping(
+        json.dumps(
+            [
+                {"field-id": 1, "names": ["shared", "one"]},
+                {"field-id": 2, "names": ["two", "shared"]},
+            ]
+        )
+    )
+    manifest = make_manifest(
+        tmp_path, [("s3://b/a.parquet", "a.parquet", "data", 1)]
+    )
+    with pytest.raises(CheckError, match="多个字段 ID") as exc_info:
+        run_backfill(
+            manifest,
+            {"a.parquet": source},
+            mapping,
+            tmp_path / "out",
+        )
+    assert exc_info.value.files == ["a.parquet"]
+    assert exc_info.value.columns == ["shared"]
+
+
+def test_ambiguous_struct_child_match_is_rejected(tmp_path):
+    source = tmp_path / "a.parquet"
+    write_parquet(
+        source,
+        [
+            pa.field(
+                "deck_fare",
+                pa.struct([pa.field("amount", pa.int64())]),
+                metadata={b"PARQUET:field_id": b"20"},
+            )
+        ],
+        [{"deck_fare": {"amount": 1}}],
+    )
+    mapping = parse_name_mapping(
+        json.dumps(
+            [
+                {
+                    "field-id": 20,
+                    "names": ["deck_fare"],
+                    "fields": [
+                        {"field-id": 21, "names": ["amount"]},
+                        {"field-id": 23, "names": ["price", "amount"]},
+                    ],
+                }
+            ]
+        )
+    )
+    manifest = make_manifest(
+        tmp_path, [("s3://b/a.parquet", "a.parquet", "data", 1)]
+    )
+    with pytest.raises(CheckError, match="多个字段 ID") as exc_info:
+        run_backfill(
+            manifest,
+            {"a.parquet": source},
+            mapping,
+            tmp_path / "out",
+        )
+    assert exc_info.value.columns == ["deck_fare.amount"]
+
+
+def test_struct_child_without_parent_submapping_is_rejected(tmp_path):
+    source = tmp_path / "a.parquet"
+    write_parquet(
+        source,
+        [
+            pa.field(
+                "deck_fare",
+                pa.struct([pa.field("amount", pa.int64())]),
+                metadata={b"PARQUET:field_id": b"20"},
+            )
+        ],
+        [{"deck_fare": {"amount": 1}}],
+    )
+    # Parent node 20 exists but has no children at all.
+    mapping = parse_name_mapping(
+        json.dumps([{"field-id": 20, "names": ["deck_fare"]}])
+    )
+    manifest = make_manifest(
+        tmp_path, [("s3://b/a.parquet", "a.parquet", "data", 1)]
+    )
+    with pytest.raises(CheckError, match="子映射") as exc_info:
+        run_backfill(
+            manifest,
+            {"a.parquet": source},
+            mapping,
+            tmp_path / "out",
+        )
+    assert exc_info.value.columns == ["deck_fare.amount"]
+
+
+# --------------------------------------------------------------------------- #
+# Duplicate IDs, unsupported types, missing files
+# --------------------------------------------------------------------------- #
+
+
+def test_duplicate_id_within_one_file_is_rejected(tmp_path):
+    # Two columns already carrying the same field ID must be rejected even
+    # though neither column needs a mapping lookup.
+    source = tmp_path / "a.parquet"
+    write_parquet(
+        source,
+        [
+            pa.field("a", pa.int64(), metadata={b"PARQUET:field_id": b"9"}),
+            pa.field("b", pa.int64(), metadata={b"PARQUET:field_id": b"9"}),
+        ],
+        [{"a": 1, "b": 2}],
+    )
+    mapping = parse_name_mapping(
+        json.dumps(
+            [
+                {"field-id": 9, "names": ["a"]},
+                {"field-id": 10, "names": ["b"]},
+            ]
+        )
+    )
+    manifest = make_manifest(
+        tmp_path, [("s3://b/a.parquet", "a.parquet", "data", 1)]
+    )
+    with pytest.raises(CheckError, match="字段 ID 9 同时出现") as exc_info:
+        run_backfill(
+            manifest,
+            {"a.parquet": source},
+            mapping,
+            tmp_path / "out",
+        )
+    assert set(exc_info.value.columns) == {"a", "b"}
+
+
+def test_mapped_id_colliding_with_existing_in_file_id_is_rejected(tmp_path):
+    # Column a already carries ID 7; column b is unmapped in the file but its
+    # mapping resolves to 7, producing an in-file duplicate.
+    source = tmp_path / "a.parquet"
+    write_parquet(
+        source,
+        [
+            pa.field("a", pa.int64(), metadata={b"PARQUET:field_id": b"7"}),
+            pa.field("b", pa.int64()),
+        ],
+        [{"a": 1, "b": 2}],
+    )
+    mapping = parse_name_mapping(
+        json.dumps(
+            [
+                {"field-id": 9, "names": ["a"]},
+                {"field-id": 7, "names": ["b"]},
+            ]
+        )
+    )
+    manifest = make_manifest(
+        tmp_path, [("s3://b/a.parquet", "a.parquet", "data", 1)]
+    )
+    with pytest.raises(CheckError, match="字段 ID 7 同时出现"):
+        run_backfill(
+            manifest,
+            {"a.parquet": source},
+            mapping,
+            tmp_path / "out",
+        )
+
+
+def test_nested_struct_is_rejected(tmp_path):
+    source = tmp_path / "a.parquet"
+    write_parquet(
+        source,
+        [
+            pa.field(
+                "outer",
+                pa.struct(
+                    [
+                        pa.field(
+                            "inner",
+                            pa.struct([pa.field("x", pa.int64())]),
+                        )
+                    ]
+                ),
+            )
+        ],
+        [{"outer": {"inner": {"x": 1}}}],
+    )
+    mapping = parse_name_mapping(
+        json.dumps(
+            [
+                {
+                    "field-id": 1,
+                    "names": ["outer"],
+                    "fields": [
+                        {
+                            "field-id": 2,
+                            "names": ["inner"],
+                            "fields": [{"field-id": 3, "names": ["x"]}],
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    manifest = make_manifest(
+        tmp_path, [("s3://b/a.parquet", "a.parquet", "data", 1)]
+    )
+    with pytest.raises(CheckError, match="嵌套 struct") as exc_info:
+        run_backfill(
+            manifest,
+            {"a.parquet": source},
+            mapping,
+            tmp_path / "out",
+        )
+    assert exc_info.value.columns == ["outer.inner"]
+
+
+def test_list_column_is_rejected(tmp_path):
+    source = tmp_path / "a.parquet"
+    write_parquet(
+        source,
+        [pa.field("tags", pa.list_(pa.int64()))],
+        [{"tags": [1, 2]}],
+    )
+    mapping = parse_name_mapping(
+        json.dumps([{"field-id": 1, "names": ["tags"]}])
+    )
+    manifest = make_manifest(
+        tmp_path, [("s3://b/a.parquet", "a.parquet", "data", 1)]
+    )
+    with pytest.raises(CheckError, match="list / map") as exc_info:
+        run_backfill(
+            manifest,
+            {"a.parquet": source},
+            mapping,
+            tmp_path / "out",
+        )
+    assert exc_info.value.columns == ["tags"]
+
+
+def test_list_inside_struct_is_rejected(tmp_path):
+    source = tmp_path / "a.parquet"
+    write_parquet(
+        source,
+        [
+            pa.field(
+                "fare",
+                pa.struct([pa.field("tags", pa.list_(pa.string()))]),
+                metadata={b"PARQUET:field_id": b"10"},
+            )
+        ],
+        [{"fare": {"tags": ["x"]}}],
+    )
+    mapping = parse_name_mapping(
+        json.dumps(
+            [
+                {
+                    "field-id": 10,
+                    "names": ["fare"],
+                    "fields": [{"field-id": 11, "names": ["tags"]}],
+                }
+            ]
+        )
+    )
+    manifest = make_manifest(
+        tmp_path, [("s3://b/a.parquet", "a.parquet", "data", 1)]
+    )
+    with pytest.raises(CheckError, match="list / map") as exc_info:
+        run_backfill(
+            manifest,
+            {"a.parquet": source},
+            mapping,
+            tmp_path / "out",
+        )
+    assert exc_info.value.columns == ["fare.tags"]
+
+
+def test_missing_replica_is_reported_and_nothing_is_written(tmp_path):
+    manifest = make_manifest(
+        tmp_path, [("s3://b/a.parquet", "a.parquet", "data", 1)]
+    )
+    mapping = parse_name_mapping(
+        json.dumps([{"field-id": 1, "names": ["a"]}])
+    )
+    out = tmp_path / "out"
+    with pytest.raises(CheckError, match="上传副本缺失") as exc_info:
+        run_backfill(manifest, {}, mapping, out)
+    assert exc_info.value.files == ["a.parquet"]
+    assert not out.exists() or not any(out.iterdir())
+
+
+def test_unreadable_parquet_is_reported(tmp_path):
+    source = tmp_path / "a.parquet"
+    source.write_bytes(b"not a parquet file")
+    mapping = parse_name_mapping(
+        json.dumps([{"field-id": 1, "names": ["a"]}])
+    )
+    manifest = make_manifest(
+        tmp_path, [("s3://b/a.parquet", "a.parquet", "data", 1)]
+    )
+    with pytest.raises(CheckError, match="无法读取 Parquet") as exc_info:
+        run_backfill(
+            manifest,
+            {"a.parquet": source},
+            mapping,
+            tmp_path / "out",
+        )
+    assert exc_info.value.files == ["a.parquet"]
+
+
+def test_equality_delete_entries_are_ignored(tmp_path):
+    source = tmp_path / "a.parquet"
+    write_parquet(source, [pa.field("a", pa.int64())], [{"a": 1}])
+    mapping = parse_name_mapping(
+        json.dumps([{"field-id": 1, "names": ["a"]}])
+    )
+    manifest = make_manifest(
+        tmp_path,
+        [
+            ("s3://b/a.parquet", "a.parquet", "data", 1),
+            ("s3://b/eq.parquet", "eq.parquet", "equality_delete", 2),
+        ],
+    )
+    out = tmp_path / "out"
+    result = run_backfill(manifest, {"a.parquet": source}, mapping, out)
+    assert [fr.entry.uploaded_filename for fr in result.file_results] == [
+        "a.parquet"
+    ]
+    assert any("equality_delete" in w for w in result.warnings)
+    assert not (out / "eq.parquet").exists()
+
+
+def test_all_or_nothing_no_output_when_second_file_fails(tmp_path):
+    good = tmp_path / "good.parquet"
     bad = tmp_path / "bad.parquet"
-    bad.write_bytes(b"this is not parquet")
-    manifest_text = (
-        "original_path,uploaded_filename,file_type,data_sequence_number\n"
-        f"s3://bucket/voyage/data/bad.parquet,bad.parquet,data,1\n"
+    write_parquet(good, [pa.field("a", pa.int64())], [{"a": 1}])
+    write_parquet(bad, [pa.field("unmapped", pa.int64())], [{"unmapped": 1}])
+    mapping = parse_name_mapping(
+        json.dumps([{"field-id": 1, "names": ["a"]}])
     )
-    manifest = parse_manifest(manifest_text)
-    with pytest.raises(CheckError) as excinfo:
-        run_check(manifest, {"bad.parquet": bad}, [4242])
-    assert "bad.parquet" in excinfo.value.files
-    assert "无法读取数据文件" in excinfo.value.message
-
-
-def test_corrupt_delete_file_aborts_with_file_name(tmp_path: Path):
-    bad = tmp_path / "bad-delete.parquet"
-    bad.write_bytes(b"this is not parquet")
-    manifest_text = (
-        "original_path,uploaded_filename,file_type,data_sequence_number\n"
-        f"{BASE}/data/data-0001.parquet,data-0001.parquet,data,7\n"
-        f"{BASE}/delete-pos/bad-delete.parquet,bad-delete.parquet,"
-        "position_delete,9\n"
+    manifest = make_manifest(
+        tmp_path,
+        [
+            ("s3://b/good.parquet", "good.parquet", "data", 1),
+            ("s3://b/bad.parquet", "bad.parquet", "data", 1),
+        ],
     )
-    manifest = parse_manifest(manifest_text)
-    uploads = {
-        "data-0001.parquet": SAMPLE / "data-0001.parquet",
-        "bad-delete.parquet": bad,
-    }
-    with pytest.raises(CheckError) as excinfo:
-        run_check(manifest, uploads, [4242])
-    assert "bad-delete.parquet" in excinfo.value.files
-    assert "无法读取位置删除文件" in excinfo.value.message
+    out = tmp_path / "out"
+    with pytest.raises(CheckError):
+        run_backfill(
+            manifest,
+            {"good.parquet": good, "bad.parquet": bad},
+            mapping,
+            out,
+        )
+    # Phase 1 must finish before any rewrite: the output dir stays empty.
+    assert not any(out.iterdir())
 
 
-def test_delete_file_missing_pos_column_aborts(tmp_path: Path):
-    bad = tmp_path / "wrong-schema.parquet"
-    pq.write_table(
-        pa.table({"file_path": [f"{BASE}/data/data-0001.parquet"]}),
-        bad,
+def test_write_failure_is_reported_and_partial_output_removed(tmp_path, monkeypatch):
+    source = tmp_path / "a.parquet"
+    write_parquet(source, [pa.field("a", pa.int64())], [{"a": 1}])
+    mapping = parse_name_mapping(
+        json.dumps([{"field-id": 1, "names": ["a"]}])
     )
-    manifest_text = (
-        "original_path,uploaded_filename,file_type,data_sequence_number\n"
-        f"{BASE}/data/data-0001.parquet,data-0001.parquet,data,7\n"
-        f"{BASE}/delete-pos/wrong-schema.parquet,wrong-schema.parquet,"
-        "position_delete,9\n"
+    manifest = make_manifest(
+        tmp_path, [("s3://b/a.parquet", "a.parquet", "data", 1)]
     )
-    manifest = parse_manifest(manifest_text)
-    uploads = {
-        "data-0001.parquet": SAMPLE / "data-0001.parquet",
-        "wrong-schema.parquet": bad,
-    }
-    with pytest.raises(CheckError) as excinfo:
-        run_check(manifest, uploads, [4242])
-    assert "wrong-schema.parquet" in excinfo.value.files
-    assert "pos" in excinfo.value.message
 
+    def boom(*args, **kwargs):
+        raise OSError("simulated disk failure")
 
-def test_data_file_missing_ticket_column_aborts(tmp_path: Path):
-    data = tmp_path / "no-ticket.parquet"
-    pq.write_table(pa.table({"other": [1, 2]}), data)
-    manifest_text = (
-        "original_path,uploaded_filename,file_type,data_sequence_number\n"
-        f"{BASE}/data/no-ticket.parquet,no-ticket.parquet,data,3\n"
-    )
-    manifest = parse_manifest(manifest_text)
-    with pytest.raises(CheckError) as excinfo:
-        run_check(manifest, {"no-ticket.parquet": data}, [4242])
-    assert "no-ticket.parquet" in excinfo.value.files
-    assert "ticket_no" in excinfo.value.message
-
-
-def test_delete_must_match_original_path(tmp_path: Path):
-    data_path = tmp_path / "data.parquet"
-    delete_path = tmp_path / "delete.parquet"
-    pq.write_table(pa.table({"ticket_no": [123]}), data_path)
-    pq.write_table(
-        pa.table(
-            {
-                "file_path": ["s3://bucket/voyage/data/other.parquet"],
-                "pos": [0],
-            }
-        ),
-        delete_path,
-    )
-    manifest_text = (
-        "original_path,uploaded_filename,file_type,data_sequence_number\n"
-        "s3://bucket/voyage/data/data.parquet,data.parquet,data,5\n"
-        "s3://bucket/voyage/delete/delete.parquet,delete.parquet,"
-        "position_delete,9\n"
-    )
-    manifest = parse_manifest(manifest_text)
-    result = run_check(
-        manifest,
-        {"data.parquet": data_path, "delete.parquet": delete_path},
-        [123],
-    )
-    ticket = result.tickets[0]
-    assert ticket.found
-    assert not ticket.deleted
-    assert ticket.occurrences[0].row_index == 0
-
-
-def test_delete_sequence_equal_to_data_sequence_is_accepted(tmp_path: Path):
-    data_path = tmp_path / "data.parquet"
-    delete_path = tmp_path / "delete.parquet"
-    pq.write_table(pa.table({"ticket_no": [123]}), data_path)
-    pq.write_table(
-        pa.table(
-            {
-                "file_path": ["s3://bucket/voyage/data/data.parquet"],
-                "pos": [0],
-            }
-        ),
-        delete_path,
-    )
-    manifest_text = (
-        "original_path,uploaded_filename,file_type,data_sequence_number\n"
-        "s3://bucket/voyage/data/data.parquet,data.parquet,data,5\n"
-        "s3://bucket/voyage/delete/delete.parquet,delete.parquet,"
-        "position_delete,5\n"
-    )
-    manifest = parse_manifest(manifest_text)
-    result = run_check(
-        manifest,
-        {"data.parquet": data_path, "delete.parquet": delete_path},
-        [123],
-    )
-    assert result.tickets[0].deleted
-
-
-def test_row_number_is_original_even_with_sparse_groups(tmp_path: Path):
-    data_path = tmp_path / "data.parquet"
-    # Three row groups of 10.  Ticket 777 is the 8th row of row group 2.
-    table = pa.table(
-        {
-            "ticket_no": list(range(0, 10))
-            + list(range(100, 110))
-            + list(range(200, 207))
-            + [777]
-            + list(range(208, 210))
-        }
-    )
-    pq.write_table(table, data_path, row_group_size=10)
-    manifest_text = (
-        "original_path,uploaded_filename,file_type,data_sequence_number\n"
-        "s3://bucket/voyage/data/data.parquet,data.parquet,data,5\n"
-    )
-    manifest = parse_manifest(manifest_text)
-    result = run_check(manifest, {"data.parquet": data_path}, [777])
-    occurrence = result.tickets[0].occurrences[0]
-    assert occurrence.row_group_index == 2
-    assert occurrence.row_group_start == 20
-    assert occurrence.local_row_index == 7
-    assert occurrence.row_index == 27
-
-
-def test_tickets_are_deduplicated_in_input_order():
-    manifest, uploads = sample_inputs()
-    result = run_check(manifest, uploads, [4242, 1003, 4242])
-    assert [t.ticket for t in result.tickets] == [4242, 1003]
+    monkeypatch.setattr("checker.engine.pq.ParquetWriter", boom)
+    out = tmp_path / "out"
+    with pytest.raises(CheckError, match="重写 Parquet 文件") as exc_info:
+        run_backfill(manifest, {"a.parquet": source}, mapping, out)
+    assert exc_info.value.files == ["a.parquet"]
+    assert not (out / "a.parquet").exists()

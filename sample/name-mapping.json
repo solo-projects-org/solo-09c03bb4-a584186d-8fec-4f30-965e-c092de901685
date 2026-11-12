@@ -1,0 +1,90 @@
+[
+  {
+    "field-id": 1,
+    "names": [
+      "ticket_no"
+    ]
+  },
+  {
+    "field-id": 2,
+    "names": [
+      "passenger_name",
+      "passenger"
+    ]
+  },
+  {
+    "field-id": 20,
+    "names": [
+      "deck_fare",
+      "deck_settlement"
+    ],
+    "fields": [
+      {
+        "field-id": 21,
+        "names": [
+          "amount",
+          "fare_amount",
+          "price"
+        ]
+      },
+      {
+        "field-id": 22,
+        "names": [
+          "currency",
+          "ccy"
+        ]
+      }
+    ]
+  },
+  {
+    "field-id": 30,
+    "names": [
+      "cabin_fare",
+      "cabin_settlement"
+    ],
+    "fields": [
+      {
+        "field-id": 31,
+        "names": [
+          "amount",
+          "fare_amount",
+          "price"
+        ]
+      },
+      {
+        "field-id": 32,
+        "names": [
+          "currency",
+          "ccy"
+        ]
+      }
+    ]
+  },
+  {
+    "field-id": 5,
+    "names": [
+      "fare_note",
+      "remark"
+    ]
+  },
+  {
+    "field-id": 6,
+    "names": [
+      "voyage_date"
+    ]
+  },
+  {
+    "field-id": 41,
+    "names": [
+      "file_path",
+      "path"
+    ]
+  },
+  {
+    "field-id": 42,
+    "names": [
+      "pos",
+      "position"
+    ]
+  }
+]

@@ -321,6 +321,11 @@ tbody tr.rg-read { background: #ffffff; }
 .kind-equality_delete { background: #eef2f6; color: #5b6b79; }
 .manifest-ignored td { color: #7a8895; }
 
+.rules-card { padding: 20px 22px; }
+.rules { margin: 0; padding-left: 20px; color: #33465a; }
+.rules li { margin: 7px 0; font-size: 13.5px; }
+.rules code { font-size: .92em; }
+
 .warnings { margin: 12px 0 0; padding-left: 18px; color: var(--amber); font-size: 13px; }
 
 .form-grid {
